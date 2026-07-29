@@ -34,8 +34,9 @@ describe("executeBash", () => {
 		await Settings.init({ inMemory: true, cwd: tempDir });
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		resetSettingsForTest();
+		await disposeAllShellSessions();
 		vi.restoreAllMocks();
 		if (fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
@@ -44,16 +45,53 @@ describe("executeBash", () => {
 
 	it("preserves an explicit capped minimizer artifact below the default cap", () => {
 		const result = normalizeMinimizedSaveResultForTests(
-			{ status: "saved", artifactId: "lower-cap", complete: false, omittedBytes: 7 },
+			{ status: "saved", artifactId: "7", complete: false, omittedBytes: 7 },
 			"short original",
 		);
 
 		expect(result).toEqual({
 			status: "saved",
-			artifactId: "lower-cap",
+			artifactId: "7",
 			complete: false,
 			omittedBytes: 7,
 		});
+	});
+
+	it("rejects invalid minimizer artifact ids", () => {
+		for (const artifactId of ["", "abc", "bad id", "bad\nid", "1/path", "1?x", "1#x"]) {
+			expect(normalizeMinimizedSaveResultForTests(artifactId, "original")).toEqual({
+				status: "failed",
+				diagnostic: "artifact save reported an invalid artifact id",
+			});
+		}
+	});
+
+	it("rejects invalid minimizer omission counts", () => {
+		for (const omittedBytes of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(
+				normalizeMinimizedSaveResultForTests(
+					{ status: "saved", artifactId: "8", complete: false, omittedBytes },
+					"original",
+				),
+			).toEqual({ status: "failed", diagnostic: "artifact save reported invalid omitted bytes" });
+		}
+	});
+
+	it("rejects malformed minimizer save result shapes", () => {
+		for (const value of [
+			null,
+			false,
+			{ status: "unknown" },
+			{ status: "failed", diagnostic: "" },
+			{ status: "saved", artifactId: 7, complete: true },
+			{ status: "saved", artifactId: "7", complete: "false" },
+			{ artifactId: "7", complete: false, omittedBytes: "9" },
+		]) {
+			expect(normalizeMinimizedSaveResultForTests(value, "original")).toEqual({
+				status: "failed",
+				diagnostic: "artifact save returned an invalid result",
+			});
+		}
 	});
 
 	it("returns non-zero exit codes without cancellation", async () => {
@@ -184,6 +222,116 @@ describe("executeBash", () => {
 		expect(seenChunk ?? "").toContain("hello");
 	});
 
+	it("marks native callback loss as source truncation", async () => {
+		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
+			onChunk?.(null, "retained-tail\n");
+			return Promise.resolve({
+				exitCode: 0,
+				cancelled: false,
+				timedOut: false,
+				droppedOutputChunks: 2,
+				droppedOutputBytes: 17,
+			});
+		});
+
+		const result = await executeBash("ignored", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey: "native-callback-loss",
+		});
+
+		expect(result.output).toContain("retained-tail");
+		expect(result.truncated).toBe(true);
+		expect(result.sourceTruncatedBytes).toBe(17);
+		await disposeAllShellSessions();
+	});
+
+	it("marks saturated native loss counters as source-incomplete", async () => {
+		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
+			exitCode: 0,
+			cancelled: false,
+			timedOut: false,
+			droppedOutputChunks: Number.MAX_SAFE_INTEGER,
+			droppedOutputBytes: Number.MAX_SAFE_INTEGER,
+			outputLossCountSaturated: true,
+		});
+
+		const result = await executeBash("ignored", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey: "saturated-source-loss",
+		});
+
+		expect(result.sourceTruncatedBytes).toBe(Number.MAX_SAFE_INTEGER);
+		expect(result.sourceCaptureIncomplete).toBe(true);
+	});
+
+	it("does not label minimized source-loss artifacts as complete", async () => {
+		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
+			exitCode: 0,
+			cancelled: false,
+			timedOut: false,
+			droppedOutputChunks: 1,
+			droppedOutputBytes: 9,
+			minimized: {
+				filter: "test",
+				text: "minimized output",
+				originalText: "partial raw output",
+				inputBytes: 18,
+				outputBytes: 16,
+			},
+		});
+
+		const result = await executeBash("ignored", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey: "minimized-source-loss",
+			onMinimizedSave: async () => "42",
+		});
+
+		expect(result.output).toContain("Read artifact://42 for retained output");
+		expect(result.output).toContain("dropped before Bash capture");
+		expect(result.output).not.toContain("raw output: artifact://42");
+		expect(result.sourceTruncatedBytes).toBe(9);
+	});
+
+	it("applies callback loss when native abort settles during cleanup", async () => {
+		const nativeResult = Promise.withResolvers<{
+			exitCode: undefined;
+			cancelled: true;
+			timedOut: false;
+			droppedOutputChunks: number;
+			droppedOutputBytes: number;
+		}>();
+		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
+			onChunk?.(null, "retained-tail\n");
+			return nativeResult.promise;
+		});
+		vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
+		const controller = new AbortController();
+		const promise = executeBash("ignored", {
+			cwd: tempDir,
+			timeout: 5000,
+			signal: controller.signal,
+			sessionKey: "settled-abort-loss",
+		});
+
+		await Bun.sleep(10);
+		controller.abort();
+		nativeResult.resolve({
+			exitCode: undefined,
+			cancelled: true,
+			timedOut: false,
+			droppedOutputChunks: 2,
+			droppedOutputBytes: 17,
+		});
+		const result = await promise;
+
+		expect(result.cancelled).toBe(true);
+		expect(result.sourceTruncatedBytes).toBe(17);
+		expect(result.sourceCaptureIncomplete).toBeUndefined();
+	});
+
 	it("returns even if command spawns a background job", async () => {
 		if (process.platform === "win32") {
 			return;
@@ -290,6 +438,7 @@ describe("executeBash", () => {
 		if (raced.type === "result") {
 			expect(raced.result.cancelled).toBe(true);
 			expect(raced.result.output).toContain("Command cancelled");
+			expect(raced.result.sourceCaptureIncomplete).toBe(true);
 		}
 		expect(abortSpy).toHaveBeenCalled();
 
@@ -367,6 +516,7 @@ describe("executeBash", () => {
 		if (raced.type === "result") {
 			expect(raced.result.cancelled).toBe(true);
 			expect(raced.result.output).toContain("Command timed out after 1 seconds");
+			expect(raced.result.sourceCaptureIncomplete).toBe(true);
 		}
 		expect(abortSpy).toHaveBeenCalled();
 	});
@@ -494,12 +644,12 @@ describe("executeBash", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.cancelled).toBe(false);
 
-		// Native execution may cap pathological streams before JavaScript sees every
-		// generated line. Keep the regression contract strong enough to prove we
-		// streamed a large bounded capture, not just a tiny non-empty placeholder.
+		// Native execution bounds pathological streams but preserves a terminal tail
+		// and reports the omitted source bytes explicitly.
 		expect(result.totalLines).toBeGreaterThan(100_000);
 		expect(result.totalBytes).toBeGreaterThan(DEFAULT_MAX_BYTES * 100);
 		expect(result.truncated).toBe(true);
+		expect(result.sourceTruncatedBytes ?? 0).toBeGreaterThan(0);
 
 		// Direct executor output remains bounded by the shared head+tail window.
 		expect(result.outputBytes).toBeLessThan(result.totalBytes);
@@ -511,7 +661,7 @@ describe("executeBash", () => {
 			.slice(-1000)
 			.map(line => Number(line.trim()))
 			.filter(Number.isFinite);
-		expect(tailValues.some(value => value >= result.totalLines - 500 && value <= result.totalLines)).toBe(true);
+		expect(tailValues.some(value => value >= lineCount - 500 && value <= lineCount)).toBe(true);
 
 		// With 64KB read buffer, ~40MB should produce ~600 chunks, not 5M.
 		// Allow generous headroom but ensure it's orders of magnitude below lineCount.

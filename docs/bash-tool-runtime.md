@@ -168,12 +168,16 @@ Both PTY and non-PTY paths use `OutputSink`.
 - `truncated`,
 - `totalLines/totalBytes`,
 - `outputLines/outputBytes`,
-- `artifactId` if artifact file was active.
-- `artifactTruncatedBytes` when the artifact hard cap omitted bytes.
+- `artifactId` if artifact file was active,
+- `artifactTruncatedBytes` when the artifact hard cap omitted bytes,
+- `sourceTruncatedBytes` when the native shell path omitted bytes before the Bash executor received them.
+- `sourceCaptureIncomplete` when a native reader, cancellation/timeout cleanup, client-owned terminal capture, or loss counter cannot prove complete exact source capture.
 
 ### Long-output caveat
 
 `BashTool` supplies a 1 KiB byte threshold to `OutputSink` by default, overridden by an explicit `tools.artifactTailBytes` setting. Direct user bang commands continue to use the executor's shared 50 KiB tail plus configured head window. Neither path enforces a hard line-count cap.
+
+The native shell path bounds both the core-to-native relay and the actual N-API callback queue at 1,024 entries and applies backpressure instead of dropping queue-full chunks. The core callback stream keeps an 8 MiB prefix budget; output beyond it is reduced to a UTF-8-safe 64 KiB terminal tail, with at most one typed aggregate loss marker inserted before that tail and exact dropped chunk/byte metadata returned within JavaScript's safe integer range. Counter saturation is surfaced as incomplete capture instead of an exact claim. Final status tokens therefore remain observable. Bash results carrying loss or unsettled-capture metadata remain truncated, notices identify an incomplete Bash capture instead of inventing original-source line coordinates, and any artifact reference is labeled as retained partial output rather than full output.
 
 ## Live tool updates and async jobs
 
@@ -214,10 +218,10 @@ Success payload structure:
 - `content`: text output,
 - `details.meta.truncation` when truncated, including:
   - `direction`, `truncatedBy`, total/output line+byte counts,
-  - `shownRange`,
-  - `artifactId` when available.
+  - `shownRange` only when the captured stream has complete source coordinates,
+  - `artifactId`, `artifactTruncatedBytes`, `sourceTruncatedBytes`, `sourceCaptureIncomplete`, and `artifactFailureDiagnostic` when available.
 
-Because built-in tools are wrapped with `wrapToolWithMetaNotice()`, truncation notice text is appended to final text content automatically; when truncation metadata includes an artifact reference, that notice can include an example such as `Full: artifact://<id>`.
+Because built-in tools are wrapped with `wrapToolWithMetaNotice()`, truncation notice text is appended to final text content automatically. Complete references use `Read artifact://<id> for full output`; source-loss, unsettled-capture, and storage-cap references use `Read artifact://<id> for retained output (...)` with every known omission disclosed.
 
 ## Rendering paths
 

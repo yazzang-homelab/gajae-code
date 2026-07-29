@@ -4,7 +4,12 @@
  * Uses brush-core via native bindings for shell execution.
  */
 import * as fs from "node:fs/promises";
-import { executeShell, type MinimizerOptions, Shell } from "@gajae-code/natives";
+import {
+	executeShell,
+	type MinimizerOptions,
+	type ShellRunResult as NativeShellRunResult,
+	Shell,
+} from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
@@ -12,6 +17,7 @@ import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	DEFAULT_MAX_BYTES,
 	OutputSink,
+	type OutputSummary,
 	type TerminalArtifactPublisher,
 	truncateHeadBytes,
 } from "../session/streaming-output";
@@ -33,7 +39,26 @@ export type BashArtifactSaveResult =
 	| { status: "unavailable" }
 	| { status: "failed"; diagnostic: string };
 
+function isValidArtifactId(artifactId: string): boolean {
+	return /^\d+$/u.test(artifactId);
+}
+
+function isValidOmittedBytes(omittedBytes: number): boolean {
+	return Number.isSafeInteger(omittedBytes) && omittedBytes >= 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function invalidArtifactSaveShape(): BashArtifactSaveResult {
+	return { status: "failed", diagnostic: "artifact save returned an invalid result" };
+}
+
 function summarizeLegacyArtifactSave(artifactId: string, originalText: string): BashArtifactSaveResult {
+	if (!isValidArtifactId(artifactId)) {
+		return { status: "failed", diagnostic: "artifact save reported an invalid artifact id" };
+	}
 	const inputBytes = Buffer.byteLength(originalText, "utf-8");
 	if (inputBytes <= DEFAULT_ARTIFACT_MAX_BYTES) {
 		return { status: "saved", artifactId, complete: true };
@@ -52,6 +77,12 @@ function normalizeExplicitSavedArtifact(
 	complete: boolean,
 	omittedBytes: number | undefined,
 ): BashArtifactSaveResult {
+	if (!isValidArtifactId(artifactId)) {
+		return { status: "failed", diagnostic: "artifact save reported an invalid artifact id" };
+	}
+	if (omittedBytes !== undefined && !isValidOmittedBytes(omittedBytes)) {
+		return { status: "failed", diagnostic: "artifact save reported invalid omitted bytes" };
+	}
 	if (complete) {
 		return (omittedBytes ?? 0) > 0
 			? { status: "failed", diagnostic: "artifact save reported complete output with omitted bytes" }
@@ -62,33 +93,63 @@ function normalizeExplicitSavedArtifact(
 		: { status: "failed", diagnostic: "artifact save reported incomplete output without omitted bytes" };
 }
 
-function normalizeMinimizedSaveResult(value: BashMinimizedSaveReturn, originalText: string): BashArtifactSaveResult {
+function normalizeMinimizedSaveResult(value: unknown, originalText: string): BashArtifactSaveResult {
+	if (value === undefined) return { status: "unavailable" };
 	if (typeof value === "string") return summarizeLegacyArtifactSave(value, originalText);
-	if (!value) return { status: "unavailable" };
-	if (!("status" in value)) {
-		return normalizeExplicitSavedArtifact(value.artifactId, value.complete, value.omittedBytes);
+	if (!isRecord(value)) return invalidArtifactSaveShape();
+
+	const status = value.status;
+	if (status === "unavailable") return { status: "unavailable" };
+	if (status === "failed") {
+		const diagnostic = value.diagnostic;
+		return typeof diagnostic === "string" && diagnostic.trim().length > 0
+			? { status: "failed", diagnostic: diagnostic.slice(0, 512) }
+			: invalidArtifactSaveShape();
 	}
-	if (value.status !== "saved") return value;
+	if (status !== undefined && status !== "saved") return invalidArtifactSaveShape();
+	if (typeof value.artifactId !== "string" || typeof value.complete !== "boolean") {
+		return invalidArtifactSaveShape();
+	}
+	if (value.omittedBytes !== undefined && typeof value.omittedBytes !== "number") {
+		return invalidArtifactSaveShape();
+	}
 	return normalizeExplicitSavedArtifact(value.artifactId, value.complete, value.omittedBytes);
 }
 
-export function normalizeMinimizedSaveResultForTests(
-	value: BashMinimizedSaveReturn,
-	originalText: string,
-): BashArtifactSaveResult {
+export function normalizeMinimizedSaveResultForTests(value: unknown, originalText: string): BashArtifactSaveResult {
 	return normalizeMinimizedSaveResult(value, originalText);
 }
 
 function completeRawArtifactAvailable(summary: {
 	artifactId?: string;
 	artifactTruncatedBytes?: number;
+	sourceTruncatedBytes?: number;
+	sourceCaptureIncomplete?: boolean;
 	artifactFailureDiagnostic?: string;
 }): boolean {
 	return (
 		summary.artifactId !== undefined &&
 		(summary.artifactTruncatedBytes ?? 0) <= 0 &&
+		(summary.sourceTruncatedBytes ?? 0) <= 0 &&
+		!summary.sourceCaptureIncomplete &&
 		summary.artifactFailureDiagnostic === undefined
 	);
+}
+
+function applyShellCallbackLoss(
+	summary: OutputSummary,
+	droppedOutputBytes: number | undefined,
+	sourceCaptureIncomplete = false,
+): OutputSummary {
+	if ((droppedOutputBytes === undefined || droppedOutputBytes <= 0) && !sourceCaptureIncomplete) return summary;
+	return {
+		...summary,
+		truncated: true,
+		...(droppedOutputBytes !== undefined && droppedOutputBytes > 0
+			? { sourceTruncatedBytes: droppedOutputBytes }
+			: {}),
+		...(sourceCaptureIncomplete ? { sourceCaptureIncomplete: true } : {}),
+	};
 }
 
 function appendModelNotice(output: string, notice: string): string {
@@ -98,7 +159,13 @@ function appendModelNotice(output: string, notice: string): string {
 
 function minimizedSaveNotice(
 	result: BashArtifactSaveResult,
-	summary: { artifactId?: string; artifactTruncatedBytes?: number; artifactFailureDiagnostic?: string },
+	summary: {
+		artifactId?: string;
+		artifactTruncatedBytes?: number;
+		sourceTruncatedBytes?: number;
+		sourceCaptureIncomplete?: boolean;
+		artifactFailureDiagnostic?: string;
+	},
 ): string | undefined {
 	if (result.status === "failed") return `Bash output artifact save failed: ${result.diagnostic}`;
 	if (result.status === "unavailable" && !completeRawArtifactAvailable(summary)) {
@@ -107,10 +174,21 @@ function minimizedSaveNotice(
 	return undefined;
 }
 
-function minimizedArtifactFooter(result: Extract<BashArtifactSaveResult, { status: "saved" }>): string {
-	const reference = result.complete
-		? `artifact://${result.artifactId}`
-		: formatArtifactReference(result.artifactId, result.omittedBytes);
+function minimizedArtifactFooter(
+	result: Extract<BashArtifactSaveResult, { status: "saved" }>,
+	sourceTruncatedBytes?: number,
+	sourceCaptureIncomplete?: boolean,
+): string {
+	const hasSourceOmission = (sourceTruncatedBytes ?? 0) > 0 || sourceCaptureIncomplete === true;
+	const reference =
+		result.complete && !hasSourceOmission
+			? `artifact://${result.artifactId}`
+			: formatArtifactReference(
+					result.artifactId,
+					result.complete ? undefined : result.omittedBytes,
+					sourceTruncatedBytes,
+					sourceCaptureIncomplete,
+				);
 	return `[raw output: ${reference}]`;
 }
 
@@ -170,15 +248,24 @@ export interface BashResult {
 	outputBytes: number;
 	artifactId?: string;
 	artifactTruncatedBytes?: number;
+	/** Bytes dropped before the Bash executor received the native output stream. */
+	sourceTruncatedBytes?: number;
+	/** Exact source capture completeness could not be proven. */
+	sourceCaptureIncomplete?: boolean;
 	artifactFailureDiagnostic?: string;
 }
 
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
 const retiringShellSessions = new Set<Shell>();
-// Cover pi-shell's normal cancellation kill waves without turning a stalled
-// native cleanup into a multi-second JavaScript tool stall.
+// Give ordinary native cancellation time to settle without turning a stalled
+// cleanup into a multi-second JavaScript tool delay.
 const CANCEL_CLEANUP_WAIT_MS = 400;
+
+interface AbortCleanupOutcome {
+	settled: boolean;
+	result?: NativeShellRunResult;
+}
 
 /** Number of persistent shell sessions currently retained (owner gauge). */
 export function getShellSessionCount(): number {
@@ -308,18 +395,19 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		abortCurrentExecution();
 		abortDeferred.resolve("abort");
 	};
-	const awaitAbortCleanup = async (runPromise: Promise<unknown>): Promise<boolean> => {
-		const settled = await Promise.race([
+	const awaitAbortCleanup = async (runPromise: Promise<NativeShellRunResult>): Promise<AbortCleanupOutcome> => {
+		const runOutcome = Promise.race([
 			runPromise.then(
-				() => true,
-				() => true,
+				result => ({ settled: true, result }) satisfies AbortCleanupOutcome,
+				() => ({ settled: true }) satisfies AbortCleanupOutcome,
 			),
-			Bun.sleep(CANCEL_CLEANUP_WAIT_MS).then(() => false),
+			Bun.sleep(CANCEL_CLEANUP_WAIT_MS).then(() => ({ settled: false }) satisfies AbortCleanupOutcome),
 		]);
-		if (abortPromise) {
-			await Promise.race([abortPromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
-		}
-		return settled;
+		const abortCleanup = abortPromise
+			? Promise.race([abortPromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)])
+			: Promise.resolve();
+		const [outcome] = await Promise.all([runOutcome, abortCleanup]);
+		return outcome;
 	};
 	if (userSignal) {
 		userSignal.addEventListener("abort", abortHandler, { once: true });
@@ -380,13 +468,14 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		]);
 
 		if (winner.kind === "timeout" || winner.kind === "abort") {
+			const abortOutcome = await awaitAbortCleanup(runPromise);
 			acceptingChunks = false;
 			if (shellSession) {
 				resetSession = true;
 				retiringShellSessions.add(shellSession);
 				brokenShellSessions.add(sessionKey);
 				shellSessions.delete(sessionKey);
-				runSettled = await awaitAbortCleanup(runPromise);
+				runSettled = abortOutcome.settled;
 				if (runSettled) {
 					brokenShellSessions.delete(sessionKey);
 					retiringShellSessions.delete(shellSession);
@@ -401,17 +490,25 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 						})
 						.catch(() => undefined);
 				}
-			} else {
+			} else if (!abortOutcome.settled) {
 				void runPromise.catch(() => undefined);
 			}
-			return {
-				exitCode: undefined,
-				cancelled: true,
-				...(await sink.dump(
+			const summary = applyShellCallbackLoss(
+				await sink.dump(
 					winner.kind === "timeout" && baseTimeoutMs !== undefined
 						? `Command timed out after ${Math.round(baseTimeoutMs / 1000)} seconds`
 						: "Command cancelled",
-				)),
+				),
+				abortOutcome.result?.droppedOutputBytes,
+				!abortOutcome.settled ||
+					abortOutcome.result === undefined ||
+					abortOutcome.result.outputCaptureIncomplete ||
+					abortOutcome.result.outputLossCountSaturated,
+			);
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				...summary,
 			};
 		}
 		if (timeoutTimer) {
@@ -428,7 +525,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
-				...(await sink.dump(annotation)),
+				...applyShellCallbackLoss(
+					await sink.dump(annotation),
+					winner.result.droppedOutputBytes,
+					winner.result.outputCaptureIncomplete || winner.result.outputLossCountSaturated,
+				),
 			};
 		}
 
@@ -438,7 +539,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			return {
 				exitCode: undefined,
 				cancelled: true,
-				...(await sink.dump("Command cancelled")),
+				...applyShellCallbackLoss(
+					await sink.dump("Command cancelled"),
+					winner.result.droppedOutputBytes,
+					winner.result.outputCaptureIncomplete || winner.result.outputLossCountSaturated,
+				),
 			};
 		}
 
@@ -460,7 +565,13 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			minimizedSaveResult = normalizeMinimizedSaveResult(saved, minimized.originalText);
 			if (minimizedSaveResult.status === "saved") {
 				const sep = minimized.text.endsWith("\n") ? "" : "\n";
-				sink.push(`${sep}${minimizedArtifactFooter(minimizedSaveResult)}\n`);
+				sink.push(
+					`${sep}${minimizedArtifactFooter(
+						minimizedSaveResult,
+						winner.result.droppedOutputBytes,
+						winner.result.outputCaptureIncomplete || winner.result.outputLossCountSaturated,
+					)}\n`,
+				);
 			}
 		}
 
@@ -480,7 +591,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 
 		// Normal completion
-		const summary = await sink.dump();
+		const summary = applyShellCallbackLoss(
+			await sink.dump(),
+			winner.result.droppedOutputBytes,
+			winner.result.outputCaptureIncomplete || winner.result.outputLossCountSaturated,
+		);
 		const saveNotice = minimizedSaveResult ? minimizedSaveNotice(minimizedSaveResult, summary) : undefined;
 		return {
 			exitCode: winner.result.exitCode,

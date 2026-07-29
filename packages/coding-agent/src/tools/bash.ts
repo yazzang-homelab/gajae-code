@@ -43,6 +43,7 @@ import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
 import { checkComposerBashPolicy } from "./composer-bash-policy";
 import {
+	formatArtifactEvidenceNotice,
 	formatArtifactReference,
 	formatStyledTruncationWarning,
 	type OutputMeta,
@@ -110,9 +111,23 @@ function artifactTruncatedBytesForResult(result: BashResult | BashInteractiveRes
 	return typeof bytes === "number" && bytes > 0 ? bytes : undefined;
 }
 
+function sourceTruncatedBytesForResult(result: BashResult | BashInteractiveResult): number | undefined {
+	const bytes = (result as OutputSummary).sourceTruncatedBytes;
+	return typeof bytes === "number" && bytes > 0 ? bytes : undefined;
+}
+
+function sourceCaptureIncompleteForResult(result: BashResult | BashInteractiveResult): boolean {
+	return (result as OutputSummary).sourceCaptureIncomplete === true;
+}
+
 function artifactReferenceForResult(result: BashResult | BashInteractiveResult): string | undefined {
 	return result.artifactId
-		? formatArtifactReference(result.artifactId, artifactTruncatedBytesForResult(result))
+		? formatArtifactReference(
+				result.artifactId,
+				artifactTruncatedBytesForResult(result),
+				sourceTruncatedBytesForResult(result),
+				sourceCaptureIncompleteForResult(result),
+			)
 		: undefined;
 }
 
@@ -137,9 +152,18 @@ function appendRawArtifactFooter(
 function artifactReferenceIsReachable(text: string, result: BashResult | BashInteractiveResult): boolean {
 	if (!result.artifactId || !text.includes(`artifact://${result.artifactId}`)) return false;
 	const artifactTruncatedBytes = artifactTruncatedBytesForResult(result);
+	const sourceTruncatedBytes = sourceTruncatedBytesForResult(result);
+	const sourceCaptureIncomplete = sourceCaptureIncompleteForResult(result);
 	return (
-		artifactTruncatedBytes === undefined ||
-		text.includes(formatArtifactReference(result.artifactId, artifactTruncatedBytes))
+		(artifactTruncatedBytes === undefined && sourceTruncatedBytes === undefined && !sourceCaptureIncomplete) ||
+		text.includes(
+			formatArtifactReference(
+				result.artifactId,
+				artifactTruncatedBytes,
+				sourceTruncatedBytes,
+				sourceCaptureIncomplete,
+			),
+		)
 	);
 }
 
@@ -159,11 +183,20 @@ function artifactWriterFailureNotice(result: BashResult | BashInteractiveResult)
 }
 
 function completeOutputArtifactAvailable(
-	result: Pick<OutputSummary, "artifactId" | "artifactTruncatedBytes" | "artifactFailureDiagnostic">,
+	result: Pick<
+		OutputSummary,
+		| "artifactId"
+		| "artifactTruncatedBytes"
+		| "sourceTruncatedBytes"
+		| "sourceCaptureIncomplete"
+		| "artifactFailureDiagnostic"
+	>,
 ): boolean {
 	return (
 		result.artifactId !== undefined &&
 		(typeof result.artifactTruncatedBytes !== "number" || result.artifactTruncatedBytes <= 0) &&
+		(typeof result.sourceTruncatedBytes !== "number" || result.sourceTruncatedBytes <= 0) &&
+		!result.sourceCaptureIncomplete &&
 		(typeof result.artifactFailureDiagnostic !== "string" || result.artifactFailureDiagnostic.length === 0)
 	);
 }
@@ -200,8 +233,8 @@ function formatBashFailureMessage(
 	const statusCause = failureStatusCause(result, text, explicitCause);
 	const bodyText = removeTrailingFailureCause(text, statusCause);
 	const suffixParts: string[] = [];
-	const reference = artifactReferenceForResult(result);
-	if (reference) suffixParts.push(reference);
+	const artifactEvidence = formatArtifactEvidenceNotice({ ...result, artifactFailureDiagnostic: undefined });
+	if (artifactEvidence) suffixParts.push(artifactEvidence);
 	const writerNotice = artifactWriterFailureNotice(result);
 	if (writerNotice) suffixParts.push(writerNotice);
 	if (statusCause) suffixParts.push(statusCause);
@@ -229,6 +262,7 @@ async function boundClientTerminalOutput(
 		summary: {
 			...bounded,
 			truncated: alreadyTruncated || bounded.truncated,
+			...(alreadyTruncated ? { sourceCaptureIncomplete: true } : {}),
 		},
 		locallyTruncated: bounded.truncated,
 	};

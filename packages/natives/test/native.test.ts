@@ -605,6 +605,59 @@ describe("pi-natives", () => {
 			await Bun.sleep(600);
 			expect(await Bun.file(markerPath).exists()).toBe(false);
 		});
+		it("preserves the terminal tail and aggregates callback loss", async () => {
+			if (process.platform === "win32") return;
+
+			let output = "";
+			const result = await executeShell(
+				{
+					command:
+						'node -e \'process.stdout.write("HEAD\\n" + "x".repeat(8 * 1024 * 1024 + 64 * 1024 + 4096) + "\\nTAIL\\n")\'',
+					cwd: testDir,
+				},
+				(error, chunk) => {
+					if (error) throw error;
+					output += chunk;
+				},
+			);
+			const lossMarkers = Array.from(
+				output.matchAll(/\[Shell output truncated: (\d+) chunks \/ (\d+) bytes dropped\]\n/g),
+			);
+			const markerDroppedBytes = lossMarkers.reduce((total, match) => total + Number(match[2]), 0);
+
+			expect(output).toContain("HEAD\n");
+			expect(output.endsWith("TAIL\n")).toBe(true);
+			expect(lossMarkers).toHaveLength(1);
+			expect(result.droppedOutputBytes).toBe(markerDroppedBytes);
+			expect(result.droppedOutputBytes ?? 0).toBeGreaterThan(0);
+			expect(result.droppedOutputChunks ?? 0).toBeGreaterThan(0);
+		});
+		it("preserves terminal-tail loss evidence when a run times out", async () => {
+			if (process.platform === "win32") return;
+
+			let output = "";
+			const result = await executeShell(
+				{
+					command:
+						'node -e \'process.stdout.write("HEAD\\n" + "x".repeat(8 * 1024 * 1024 + 64 * 1024 + 4096) + "\\nTAIL\\n"); setTimeout(() => {}, 30000)\'',
+					cwd: testDir,
+					timeoutMs: 1000,
+				},
+				(error, chunk) => {
+					if (error) throw error;
+					output += chunk;
+				},
+			);
+			const lossMarkers = Array.from(
+				output.matchAll(/\[Shell output truncated: (\d+) chunks \/ (\d+) bytes dropped\]\n/g),
+			);
+
+			expect(result.timedOut).toBe(true);
+			expect(result.outputCaptureIncomplete).toBe(true);
+			expect(output.endsWith("TAIL\n")).toBe(true);
+			expect(lossMarkers).toHaveLength(1);
+			expect(result.droppedOutputBytes).toBe(Number(lossMarkers[0]?.[2]));
+		});
 	});
 	describe("htmlToMarkdown", () => {
 		it("should convert basic HTML to markdown", async () => {

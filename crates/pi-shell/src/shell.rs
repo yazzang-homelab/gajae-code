@@ -1,13 +1,13 @@
 //! Runtime-agnostic brush shell execution.
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{HashMap, HashSet, VecDeque},
 	fs,
 	io::{self, Write},
 	str,
 	sync::{
 		Arc,
-		atomic::{AtomicI32, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
 	},
 	time::Duration,
 };
@@ -136,16 +136,36 @@ pub struct MinimizerResult {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShellRunResult {
-	pub exit_code:              Option<i32>,
-	pub cancelled:              bool,
-	pub timed_out:              bool,
-	pub minimized:              Option<MinimizerResult>,
-	pub output_truncated:       bool,
-	pub output_truncated_bytes: u64,
-	pub stdout_truncated:       bool,
-	pub stdout_truncated_bytes: u64,
-	pub stderr_truncated:       bool,
-	pub stderr_truncated_bytes: u64,
+	pub exit_code:                 Option<i32>,
+	pub cancelled:                 bool,
+	pub timed_out:                 bool,
+	pub minimized:                 Option<MinimizerResult>,
+	pub output_truncated:          bool,
+	#[serde(default)]
+	pub output_capture_incomplete: bool,
+	#[serde(default)]
+	pub output_truncated_chunks:   u64,
+	pub output_truncated_bytes:    u64,
+	pub stdout_truncated:          bool,
+	pub stdout_truncated_bytes:    u64,
+	pub stderr_truncated:          bool,
+	pub stderr_truncated_bytes:    u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellOutputChunk {
+	pub text:                  String,
+	pub synthetic_loss_marker: bool,
+}
+
+impl ShellOutputChunk {
+	const fn source(text: String) -> Self {
+		Self { text, synthetic_loss_marker: false }
+	}
+
+	const fn loss_marker(text: String) -> Self {
+		Self { text, synthetic_loss_marker: true }
+	}
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,7 +214,7 @@ impl Shell {
 	pub async fn run(
 		&self,
 		options: ShellRunOptions,
-		on_chunk: Option<mpsc::UnboundedSender<String>>,
+		on_chunk: Option<mpsc::Sender<ShellOutputChunk>>,
 		mut cancel_token: CancelToken,
 	) -> Result<ShellRunResult> {
 		let run_config = ShellRunConfig {
@@ -221,7 +241,7 @@ impl Shell {
 
 pub async fn execute_shell(
 	options: ShellExecuteOptions,
-	on_chunk: Option<mpsc::UnboundedSender<String>>,
+	on_chunk: Option<mpsc::Sender<ShellOutputChunk>>,
 	cancel_token: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let minimizer = options
@@ -279,7 +299,7 @@ async fn run_shell_session(
 	abort_state: ShellAbortState,
 	config: ShellConfig,
 	run_config: ShellRunConfig,
-	on_chunk: Option<mpsc::UnboundedSender<String>>,
+	on_chunk: Option<mpsc::Sender<ShellOutputChunk>>,
 	ct: &mut CancelToken,
 ) -> Result<ShellRunResult> {
 	let tokio_cancel = CancellationToken::new();
@@ -310,10 +330,15 @@ async fn run_shell_session(
 			// Per-command cancellation handles descendant termination after the
 			// serialized session lock is acquired; do not use a queued run baseline.
 			let graceful = time::timeout(Duration::from_secs(2), &mut run_task).await;
-			if graceful.is_err() {
-				run_task.abort();
-				let _ = run_task.await;
-			}
+			let truncation = match graceful {
+				Ok(Ok(Ok((_, _, truncation)))) => truncation,
+				Ok(_) => OutputTruncation::incomplete(),
+				Err(_) => {
+					run_task.abort();
+					let _ = run_task.await;
+					OutputTruncation::incomplete()
+				},
+			};
 			abort_state.clear(abort_generation).await;
 			// Use try_lock to avoid deadlocking if another task holds the session.
 			// If we can't acquire the lock, the session will be cleaned up when the
@@ -321,18 +346,7 @@ async fn run_shell_session(
 			if let Ok(mut guard) = session.try_lock() {
 				*guard = None;
 			}
-			return Ok(ShellRunResult {
-				exit_code: None,
-				cancelled: matches!(reason, AbortReason::Signal),
-				timed_out: matches!(reason, AbortReason::Timeout),
-				minimized: None,
-				output_truncated: false,
-				output_truncated_bytes: 0,
-				stdout_truncated: false,
-				stdout_truncated_bytes: 0,
-				stderr_truncated: false,
-				stderr_truncated_bytes: 0,
-			});
+			return Ok(interrupted_shell_result(reason, truncation));
 		}
 	};
 	let res =
@@ -350,6 +364,8 @@ async fn run_shell_session(
 		timed_out: false,
 		minimized,
 		output_truncated: truncation.output_truncated,
+		output_capture_incomplete: truncation.output_capture_incomplete,
+		output_truncated_chunks: truncation.output_truncated_chunks,
 		output_truncated_bytes: truncation.output_truncated_bytes,
 		stdout_truncated: truncation.stdout_truncated,
 		stdout_truncated_bytes: truncation.stdout_truncated_bytes,
@@ -361,7 +377,7 @@ async fn run_shell_session(
 async fn run_shell_oneshot(
 	config: ShellConfig,
 	run_config: ShellRunConfig,
-	on_chunk: Option<mpsc::UnboundedSender<String>>,
+	on_chunk: Option<mpsc::Sender<ShellOutputChunk>>,
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
@@ -381,22 +397,16 @@ async fn run_shell_oneshot(
 			tokio_cancel.cancel();
 			terminate_new_descendants(&baseline_descendants, 0).await;
 			let graceful = time::timeout(Duration::from_secs(2), &mut task).await;
-			if graceful.is_err() {
-				task.abort();
-				let _ = task.await;
-			}
-			return Ok(ShellExecuteResult {
-				exit_code: None,
-				cancelled: matches!(reason, AbortReason::Signal),
-				timed_out: matches!(reason, AbortReason::Timeout),
-				minimized: None,
-				output_truncated: false,
-				output_truncated_bytes: 0,
-				stdout_truncated: false,
-				stdout_truncated_bytes: 0,
-				stderr_truncated: false,
-				stderr_truncated_bytes: 0,
-			});
+			let truncation = match graceful {
+				Ok(Ok(Ok((_, _, truncation)))) => truncation,
+				Ok(_) => OutputTruncation::incomplete(),
+				Err(_) => {
+					task.abort();
+					let _ = task.await;
+					OutputTruncation::incomplete()
+				},
+			};
+			return Ok(interrupted_shell_result(reason, truncation));
 		},
 	};
 
@@ -409,6 +419,8 @@ async fn run_shell_oneshot(
 		timed_out: false,
 		minimized,
 		output_truncated: truncation.output_truncated,
+		output_capture_incomplete: truncation.output_capture_incomplete,
+		output_truncated_chunks: truncation.output_truncated_chunks,
 		output_truncated_bytes: truncation.output_truncated_bytes,
 		stdout_truncated: truncation.stdout_truncated,
 		stdout_truncated_bytes: truncation.stdout_truncated_bytes,
@@ -440,22 +452,16 @@ async fn run_shell_oneshot_streams(
 			tokio_cancel.cancel();
 			terminate_new_descendants(&baseline_descendants, 0).await;
 			let graceful = time::timeout(Duration::from_secs(2), &mut task).await;
-			if graceful.is_err() {
-				task.abort();
-				let _ = task.await;
-			}
-			return Ok(ShellExecuteResult {
-				exit_code: None,
-				cancelled: matches!(reason, AbortReason::Signal),
-				timed_out: matches!(reason, AbortReason::Timeout),
-				minimized: None,
-				output_truncated: false,
-				output_truncated_bytes: 0,
-				stdout_truncated: false,
-				stdout_truncated_bytes: 0,
-				stderr_truncated: false,
-				stderr_truncated_bytes: 0,
-			});
+			let truncation = match graceful {
+				Ok(Ok(Ok((_, truncation)))) => truncation,
+				Ok(_) => OutputTruncation::incomplete(),
+				Err(_) => {
+					task.abort();
+					let _ = task.await;
+					OutputTruncation::incomplete()
+				},
+			};
+			return Ok(interrupted_shell_result(reason, truncation));
 		},
 	};
 
@@ -463,16 +469,18 @@ async fn run_shell_oneshot_streams(
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
 	let (exec, truncation) = res?;
 	Ok(ShellExecuteResult {
-		exit_code:              Some(exit_code(&exec)),
-		cancelled:              false,
-		timed_out:              false,
-		minimized:              None,
-		output_truncated:       truncation.output_truncated,
-		output_truncated_bytes: truncation.output_truncated_bytes,
-		stdout_truncated:       truncation.stdout_truncated,
-		stdout_truncated_bytes: truncation.stdout_truncated_bytes,
-		stderr_truncated:       truncation.stderr_truncated,
-		stderr_truncated_bytes: truncation.stderr_truncated_bytes,
+		exit_code:                 Some(exit_code(&exec)),
+		cancelled:                 false,
+		timed_out:                 false,
+		minimized:                 None,
+		output_truncated:          truncation.output_truncated,
+		output_capture_incomplete: truncation.output_capture_incomplete,
+		output_truncated_chunks:   truncation.output_truncated_chunks,
+		output_truncated_bytes:    truncation.output_truncated_bytes,
+		stdout_truncated:          truncation.stdout_truncated,
+		stdout_truncated_bytes:    truncation.stdout_truncated_bytes,
+		stderr_truncated:          truncation.stderr_truncated,
+		stderr_truncated_bytes:    truncation.stderr_truncated_bytes,
 	})
 }
 
@@ -491,6 +499,26 @@ const fn exit_code(result: &ExecutionResult) -> i32 {
 		ExecutionExitCode::Interrupted => 130,
 		ExecutionExitCode::BrokenPipe => 141,
 		ExecutionExitCode::Custom(code) => code as i32,
+	}
+}
+
+const fn interrupted_shell_result(
+	reason: AbortReason,
+	truncation: OutputTruncation,
+) -> ShellRunResult {
+	ShellRunResult {
+		exit_code:                 None,
+		cancelled:                 matches!(reason, AbortReason::Signal),
+		timed_out:                 matches!(reason, AbortReason::Timeout),
+		minimized:                 None,
+		output_truncated:          truncation.output_truncated,
+		output_capture_incomplete: truncation.output_capture_incomplete,
+		output_truncated_chunks:   truncation.output_truncated_chunks,
+		output_truncated_bytes:    truncation.output_truncated_bytes,
+		stdout_truncated:          truncation.stdout_truncated,
+		stdout_truncated_bytes:    truncation.stdout_truncated_bytes,
+		stderr_truncated:          truncation.stderr_truncated,
+		stderr_truncated_bytes:    truncation.stderr_truncated_bytes,
 	}
 }
 
@@ -654,7 +682,7 @@ async fn source_snapshot(shell: &mut BrushShell, snapshot_path: &str) -> Result<
 async fn run_shell_command(
 	session: &mut ShellSessionCore,
 	options: &ShellRunConfig,
-	on_chunk: Option<mpsc::UnboundedSender<String>>,
+	on_chunk: Option<mpsc::Sender<ShellOutputChunk>>,
 	cancel_token: CancellationToken,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
@@ -832,6 +860,7 @@ async fn run_shell_command(
 		return Err(err);
 	}
 	let result = result.map_err(|err| Error::msg(format!("Shell execution failed: {err}")))?;
+	let output_capture_incomplete = reader_output.is_none() || output_budget.capture_incomplete();
 	let mut minimized_out: Option<MinimizerResult> = None;
 	if let Some(OutputRead::Buffered(output)) = reader_output
 		&& let Some(config) = options.minimizer.as_ref()
@@ -858,9 +887,12 @@ async fn run_shell_command(
 			});
 		}
 	}
+	let truncated_chunks = output_budget.truncated_chunks();
 	let truncated_bytes = output_budget.truncated_bytes();
 	Ok((result, minimized_out, OutputTruncation {
 		output_truncated: truncated_bytes > 0,
+		output_capture_incomplete,
+		output_truncated_chunks: truncated_chunks,
 		output_truncated_bytes: truncated_bytes,
 		..Default::default()
 	}))
@@ -1092,7 +1124,7 @@ async fn read_output_bytes(
 				break;
 			}
 			if allowed < buf.len() {
-				budget.mark_truncated(buf.len() - allowed);
+				budget.mark_truncated(1, buf.len() - allowed);
 			}
 		}
 	}
@@ -1297,20 +1329,103 @@ struct BufferedOutput {
 	exceeded: bool,
 }
 
+const OUTPUT_CALLBACK_TAIL_BYTES: usize = 64 * 1024;
+const OUTPUT_LOSS_MARKER_PREFIX: &str = "\n[Shell output truncated: ";
+
+#[derive(Debug)]
+struct OutputTailChunk {
+	text:            String,
+	offset:          usize,
+	counted_dropped: bool,
+}
+
+#[derive(Debug)]
+struct OutputTail {
+	chunks:         VecDeque<OutputTailChunk>,
+	bytes:          usize,
+	max_bytes:      usize,
+	dropped_chunks: usize,
+	dropped_bytes:  usize,
+}
+
+impl OutputTail {
+	const fn new(max_bytes: usize) -> Self {
+		Self { chunks: VecDeque::new(), bytes: 0, max_bytes, dropped_chunks: 0, dropped_bytes: 0 }
+	}
+
+	fn push(&mut self, text: &str) {
+		if text.is_empty() {
+			return;
+		}
+		self.bytes = self.bytes.saturating_add(text.len());
+		self.chunks.push_back(OutputTailChunk {
+			text:            text.to_string(),
+			offset:          0,
+			counted_dropped: false,
+		});
+
+		while self.bytes > self.max_bytes {
+			let overflow = self.bytes - self.max_bytes;
+			let Some(front) = self.chunks.front() else {
+				break;
+			};
+			let remaining = front.text.len() - front.offset;
+			let mut dropped = remaining.min(overflow);
+			if dropped < remaining {
+				let mut cut = front.offset + dropped;
+				while cut < front.text.len() && !front.text.is_char_boundary(cut) {
+					cut += 1;
+				}
+				dropped = cut - front.offset;
+			}
+			let drop_whole = dropped == remaining;
+			let count_chunk = !front.counted_dropped;
+
+			if count_chunk {
+				self.dropped_chunks = self.dropped_chunks.saturating_add(1);
+			}
+			self.dropped_bytes = self.dropped_bytes.saturating_add(dropped);
+			self.bytes -= dropped;
+			if drop_whole {
+				self.chunks.pop_front();
+			} else if let Some(front) = self.chunks.front_mut() {
+				front.offset += dropped;
+				front.counted_dropped = true;
+			}
+		}
+	}
+
+	fn pop_front(&mut self) -> Option<String> {
+		let chunk = self.chunks.pop_front()?;
+		let retained = chunk.text[chunk.offset..].to_string();
+		self.bytes -= retained.len();
+		Some(retained)
+	}
+}
 #[derive(Debug, Clone, Copy, Default)]
 struct OutputTruncation {
-	output_truncated:       bool,
-	output_truncated_bytes: u64,
-	stdout_truncated:       bool,
-	stdout_truncated_bytes: u64,
-	stderr_truncated:       bool,
-	stderr_truncated_bytes: u64,
+	output_truncated:          bool,
+	output_capture_incomplete: bool,
+	output_truncated_chunks:   u64,
+	output_truncated_bytes:    u64,
+	stdout_truncated:          bool,
+	stdout_truncated_bytes:    u64,
+	stderr_truncated:          bool,
+	stderr_truncated_bytes:    u64,
+}
+
+impl OutputTruncation {
+	fn incomplete() -> Self {
+		Self { output_capture_incomplete: true, ..Self::default() }
+	}
 }
 
 #[derive(Clone)]
 struct OutputBudget {
-	remaining: Arc<AtomicUsize>,
-	truncated: Arc<AtomicUsize>,
+	remaining:          Arc<AtomicUsize>,
+	truncated:          Arc<AtomicUsize>,
+	truncated_chunks:   Arc<AtomicUsize>,
+	capture_incomplete: Arc<AtomicBool>,
 }
 
 impl OutputBudget {
@@ -1318,17 +1433,32 @@ impl OutputBudget {
 
 	fn new(limit: usize) -> Self {
 		Self {
-			remaining: Arc::new(AtomicUsize::new(limit)),
-			truncated: Arc::new(AtomicUsize::new(0)),
+			remaining:          Arc::new(AtomicUsize::new(limit)),
+			truncated:          Arc::new(AtomicUsize::new(0)),
+			truncated_chunks:   Arc::new(AtomicUsize::new(0)),
+			capture_incomplete: Arc::new(AtomicBool::new(false)),
 		}
 	}
 
-	fn mark_truncated(&self, bytes: usize) {
+	fn mark_truncated(&self, chunks: usize, bytes: usize) {
+		self.truncated_chunks.fetch_add(chunks, Ordering::SeqCst);
 		self.truncated.fetch_add(bytes, Ordering::SeqCst);
+	}
+
+	fn mark_capture_incomplete(&self) {
+		self.capture_incomplete.store(true, Ordering::SeqCst);
+	}
+
+	fn capture_incomplete(&self) -> bool {
+		self.capture_incomplete.load(Ordering::SeqCst)
 	}
 
 	fn truncated_bytes(&self) -> u64 {
 		u64::try_from(self.truncated.load(Ordering::SeqCst)).unwrap_or(u64::MAX)
+	}
+
+	fn truncated_chunks(&self) -> u64 {
+		u64::try_from(self.truncated_chunks.load(Ordering::SeqCst)).unwrap_or(u64::MAX)
 	}
 }
 
@@ -1371,7 +1501,7 @@ async fn shutdown_reader_unit_task(
 
 async fn read_output(
 	reader: fs::File,
-	on_chunk: Option<mpsc::UnboundedSender<String>>,
+	on_chunk: Option<mpsc::Sender<ShellOutputChunk>>,
 	cancel_token: CancellationToken,
 	activity: mpsc::Sender<()>,
 	budget: OutputBudget,
@@ -1380,9 +1510,11 @@ async fn read_output(
 	const BUF: usize = 65536;
 	let mut buf = vec![0u8; BUF + 4]; // +4 for max UTF-8 char
 	let mut it = 0;
+	let mut callback_tail = OutputTail::new(OUTPUT_CALLBACK_TAIL_BYTES);
 
 	#[cfg(unix)]
 	let Ok(reader) = register_nonblocking_pipe(reader) else {
+		budget.mark_capture_incomplete();
 		return;
 	};
 	#[cfg(not(unix))]
@@ -1395,15 +1527,22 @@ async fn read_output(
 		let n = {
 			let Ok(mut readiness) = (tokio::select! {
 				ready = reader.readable() => ready,
-				() = cancel_token.cancelled() => break,
+				() = cancel_token.cancelled() => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 			}) else {
+				budget.mark_capture_incomplete();
 				break;
 			};
 			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf[it..BUF])) {
 				Ok(Ok(0)) => break,
 				Ok(Ok(n)) => n,
 				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Ok(Err(_)) => break,
+				Ok(Err(_)) => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 				Err(_would_block) => continue,
 			}
 		};
@@ -1413,12 +1552,18 @@ async fn read_output(
 			tokio::pin!(read_future);
 			match tokio::select! {
 				res = &mut read_future => res,
-				() = cancel_token.cancelled() => break,
+				() = cancel_token.cancelled() => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 			} {
 				Ok(0) => break, // EOF
 				Ok(n) => n,
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Err(_) => break,
+				Err(_) => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 			}
 		};
 		if n > 0 {
@@ -1431,7 +1576,7 @@ async fn read_output(
 			let pending = &buf[..it];
 			match str::from_utf8(pending) {
 				Ok(text) => {
-					emit_chunk(text, on_chunk.as_ref(), &budget);
+					emit_chunk(text, on_chunk.as_ref(), &budget, &mut callback_tail).await;
 					it = 0;
 					break;
 				},
@@ -1440,7 +1585,7 @@ async fn read_output(
 					if p > 0 {
 						// SAFETY: [..p] is guaranteed valid UTF-8 by valid_up_to().
 						let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-						emit_chunk(text, on_chunk.as_ref(), &budget);
+						emit_chunk(text, on_chunk.as_ref(), &budget, &mut callback_tail).await;
 						// copy p..it to the beginning of the buffer
 						buf.copy_within(p..it, 0);
 						it -= p;
@@ -1449,7 +1594,7 @@ async fn read_output(
 					match err.error_len() {
 						Some(p) => {
 							// Invalid byte sequence: emit replacement and drop those bytes.
-							emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
+							emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget, &mut callback_tail).await;
 							// copy p..it to the beginning of the buffer
 							buf.copy_within(p..it, 0);
 							it -= p;
@@ -1470,17 +1615,18 @@ async fn read_output(
 	for chunk in buf[..it].utf8_chunks() {
 		let valid = chunk.valid();
 		if !valid.is_empty() {
-			emit_chunk(valid, on_chunk.as_ref(), &budget);
+			emit_chunk(valid, on_chunk.as_ref(), &budget, &mut callback_tail).await;
 		}
 		if !chunk.invalid().is_empty() {
-			emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
+			emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget, &mut callback_tail).await;
 		}
 	}
+	flush_output_tail(on_chunk.as_ref(), &budget, &mut callback_tail).await;
 }
 
 async fn read_output_buffered(
 	reader: fs::File,
-	on_chunk: Option<mpsc::UnboundedSender<String>>,
+	on_chunk: Option<mpsc::Sender<ShellOutputChunk>>,
 	cancel_token: CancellationToken,
 	activity: mpsc::Sender<()>,
 	max_capture_bytes: usize,
@@ -1495,9 +1641,11 @@ async fn read_output_buffered(
 	// them back so we emit only valid UTF-8 to the streaming callback while
 	// still capturing every byte into `captured` for post-processing.
 	let mut pending = Vec::<u8>::new();
+	let mut callback_tail = OutputTail::new(OUTPUT_CALLBACK_TAIL_BYTES);
 
 	#[cfg(unix)]
 	let Ok(reader) = register_nonblocking_pipe(reader) else {
+		budget.mark_capture_incomplete();
 		return BufferedOutput { text: String::new(), exceeded: true };
 	};
 	#[cfg(not(unix))]
@@ -1510,15 +1658,22 @@ async fn read_output_buffered(
 		let n = {
 			let Ok(mut readiness) = (tokio::select! {
 				ready = reader.readable() => ready,
-				() = cancel_token.cancelled() => break,
+				() = cancel_token.cancelled() => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 			}) else {
+				budget.mark_capture_incomplete();
 				break;
 			};
 			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
 				Ok(Ok(0)) => break,
 				Ok(Ok(n)) => n,
 				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Ok(Err(_)) => break,
+				Ok(Err(_)) => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 				Err(_would_block) => continue,
 			}
 		};
@@ -1528,12 +1683,18 @@ async fn read_output_buffered(
 			tokio::pin!(read_future);
 			match tokio::select! {
 				res = &mut read_future => res,
-				() = cancel_token.cancelled() => break,
+				() = cancel_token.cancelled() => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 			} {
 				Ok(0) => break,
 				Ok(n) => n,
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-				Err(_) => break,
+				Err(_) => {
+					budget.mark_capture_incomplete();
+					break;
+				},
 			}
 		};
 		if n > 0 {
@@ -1558,7 +1719,7 @@ async fn read_output_buffered(
 			while !pending.is_empty() {
 				match str::from_utf8(&pending) {
 					Ok(text) => {
-						emit_chunk(text, Some(cb), &budget);
+						emit_chunk(text, Some(cb), &budget, &mut callback_tail).await;
 						pending.clear();
 						break;
 					},
@@ -1567,12 +1728,12 @@ async fn read_output_buffered(
 						if p > 0 {
 							// SAFETY: [..p] is valid UTF-8 per valid_up_to().
 							let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-							emit_chunk(text, Some(cb), &budget);
+							emit_chunk(text, Some(cb), &budget, &mut callback_tail).await;
 							pending.drain(..p);
 						}
 						match err.error_len() {
 							Some(skip) => {
-								emit_chunk(REPLACEMENT, Some(cb), &budget);
+								emit_chunk(REPLACEMENT, Some(cb), &budget, &mut callback_tail).await;
 								pending.drain(..skip);
 							},
 							None => break,
@@ -1588,13 +1749,14 @@ async fn read_output_buffered(
 		for chunk in pending.utf8_chunks() {
 			let valid = chunk.valid();
 			if !valid.is_empty() {
-				emit_chunk(valid, Some(cb), &budget);
+				emit_chunk(valid, Some(cb), &budget, &mut callback_tail).await;
 			}
 			if !chunk.invalid().is_empty() {
-				emit_chunk(REPLACEMENT, Some(cb), &budget);
+				emit_chunk(REPLACEMENT, Some(cb), &budget, &mut callback_tail).await;
 			}
 		}
 	}
+	flush_output_tail(on_chunk.as_ref(), &budget, &mut callback_tail).await;
 
 	BufferedOutput { text: String::from_utf8_lossy(&captured).into_owned(), exceeded }
 }
@@ -1639,31 +1801,74 @@ fn read_nonblocking<T: std::os::fd::AsRawFd>(file: &T, buf: &mut [u8]) -> io::Re
 	}
 }
 
-fn emit_chunk(text: &str, callback: Option<&mpsc::UnboundedSender<String>>, budget: &OutputBudget) {
+async fn emit_chunk(
+	text: &str,
+	callback: Option<&mpsc::Sender<ShellOutputChunk>>,
+	budget: &OutputBudget,
+	tail: &mut OutputTail,
+) {
 	if text.is_empty() {
 		return;
 	}
-	if let Some(callback) = callback {
-		let allowed = budget
-			.remaining
-			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-				Some(remaining.saturating_sub(text.len()))
-			})
-			.unwrap_or(0)
-			.min(text.len());
-		if allowed == 0 {
-			budget.mark_truncated(text.len());
+	let Some(callback) = callback else {
+		return;
+	};
+	let allowed = budget
+		.remaining
+		.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+			Some(remaining.saturating_sub(text.len()))
+		})
+		.unwrap_or(0)
+		.min(text.len());
+	let mut end = allowed;
+	while !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	if end > 0
+		&& callback
+			.send(ShellOutputChunk::source(text[..end].to_string()))
+			.await
+			.is_err()
+	{
+		budget.mark_capture_incomplete();
+		return;
+	}
+	if end < text.len() {
+		tail.push(&text[end..]);
+	}
+}
+
+async fn flush_output_tail(
+	callback: Option<&mpsc::Sender<ShellOutputChunk>>,
+	budget: &OutputBudget,
+	tail: &mut OutputTail,
+) {
+	let Some(callback) = callback else {
+		return;
+	};
+	if tail.dropped_bytes > 0 {
+		budget.mark_truncated(tail.dropped_chunks, tail.dropped_bytes);
+		let marker = format!(
+			"{OUTPUT_LOSS_MARKER_PREFIX}{} chunks / {} bytes dropped]\n",
+			tail.dropped_chunks, tail.dropped_bytes
+		);
+		if callback
+			.send(ShellOutputChunk::loss_marker(marker))
+			.await
+			.is_err()
+		{
+			budget.mark_capture_incomplete();
 			return;
 		}
-		let mut end = allowed;
-		while !text.is_char_boundary(end) {
-			end -= 1;
-		}
-		if end > 0 && callback.send(text[..end].to_string()).is_err() {
-			return;
-		}
-		if end < text.len() {
-			budget.mark_truncated(text.len() - end);
+	}
+	while let Some(chunk) = tail.pop_front() {
+		if callback
+			.send(ShellOutputChunk::source(chunk))
+			.await
+			.is_err()
+		{
+			budget.mark_capture_incomplete();
+			break;
 		}
 	}
 }
@@ -2147,6 +2352,7 @@ mod tests {
 
 		assert!(result.cancelled, "latched Shell::abort should surface as cancellation");
 		assert_eq!(result.exit_code, None);
+		assert!(result.output_capture_incomplete);
 		assert!(started.elapsed() < Duration::from_secs(2), "command was not interrupted promptly");
 	}
 
@@ -2155,8 +2361,8 @@ mod tests {
 	async fn overlapping_shell_abort_interrupts_active_run_not_queued_run() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
 		let shell = Arc::new(Shell::new(None));
-		let (first_tx, mut first_rx) = mpsc::unbounded_channel::<String>();
-		let (second_tx, mut second_rx) = mpsc::unbounded_channel::<String>();
+		let (first_tx, mut first_rx) = mpsc::channel::<ShellOutputChunk>(1024);
+		let (second_tx, mut second_rx) = mpsc::channel::<ShellOutputChunk>(1024);
 
 		let first = tokio::spawn({
 			let shell = shell.clone();
@@ -2183,7 +2389,7 @@ mod tests {
 				.await
 				.expect("first command should emit startup marker")
 				.expect("first output channel should remain open");
-			first_seen.push_str(&chunk);
+			first_seen.push_str(&chunk.text);
 		}
 		assert!(first_seen.starts_with("first-started"), "unexpected first output: {first_seen:?}");
 
@@ -2213,6 +2419,7 @@ mod tests {
 			.expect("active run should return a result");
 		assert!(first_result.cancelled, "abort should target the active first run");
 		assert_eq!(first_result.exit_code, None);
+		assert!(first_result.output_capture_incomplete);
 
 		let second_result = time::timeout(Duration::from_secs(2), second)
 			.await
@@ -2230,7 +2437,7 @@ mod tests {
 				.await
 				.expect("second command should emit after active abort")
 				.expect("second output channel should remain open");
-			second_seen.push_str(&chunk);
+			second_seen.push_str(&chunk.text);
 		}
 		assert_eq!(second_seen, "second-ran");
 	}
@@ -2238,18 +2445,79 @@ mod tests {
 	#[tokio::test]
 	async fn output_budget_caps_streaming_chunks() {
 		let budget = OutputBudget::new(5);
-		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let mut tail = OutputTail::new(3);
+		let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(1024);
 
-		emit_chunk("hello", Some(&tx), &budget);
-		emit_chunk("world", Some(&tx), &budget);
+		emit_chunk("hello", Some(&tx), &budget, &mut tail).await;
+		emit_chunk("world", Some(&tx), &budget, &mut tail).await;
+		flush_output_tail(Some(&tx), &budget, &mut tail).await;
 		drop(tx);
 
 		let mut received = String::new();
 		while let Some(chunk) = rx.recv().await {
-			received.push_str(&chunk);
+			received.push_str(&chunk.text);
 		}
-		assert_eq!(received, "hello");
-		assert_eq!(budget.truncated_bytes(), 5);
+		assert!(received.contains("1 chunks / 2 bytes dropped"));
+		assert!(received.ends_with("rld"));
+		assert_eq!(budget.truncated_chunks(), 1);
+		assert_eq!(budget.truncated_bytes(), 2);
+	}
+
+	#[tokio::test]
+	async fn output_callback_channel_applies_backpressure() {
+		let budget = OutputBudget::new(16);
+		let mut first_tail = OutputTail::new(4);
+		let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(1);
+		emit_chunk("first", Some(&tx), &budget, &mut first_tail).await;
+
+		let second = tokio::spawn({
+			let tx = tx.clone();
+			let budget = budget.clone();
+			async move {
+				let mut tail = OutputTail::new(4);
+				emit_chunk("second", Some(&tx), &budget, &mut tail).await;
+			}
+		});
+		tokio::task::yield_now().await;
+		assert!(!second.is_finished(), "second send should wait for channel capacity");
+
+		assert_eq!(rx.recv().await.expect("first chunk").text, "first");
+		time::timeout(Duration::from_secs(1), second)
+			.await
+			.expect("second send should unblock")
+			.expect("second sender should not panic");
+		assert_eq!(rx.recv().await.expect("second chunk").text, "second");
+	}
+
+	#[test]
+	fn output_chunk_provenance_distinguishes_user_marker_text() {
+		let text = format!("{OUTPUT_LOSS_MARKER_PREFIX}1 chunks / 1 bytes dropped]\n");
+		assert!(!ShellOutputChunk::source(text.clone()).synthetic_loss_marker);
+		assert!(ShellOutputChunk::loss_marker(text).synthetic_loss_marker);
+	}
+
+	#[test]
+	fn output_tail_counts_partial_source_chunk_once() {
+		let mut tail = OutputTail::new(4);
+		tail.push("abcdef");
+		tail.push("g");
+
+		assert_eq!(tail.dropped_chunks, 1);
+		assert_eq!(tail.dropped_bytes, 3);
+		assert_eq!(tail.pop_front().as_deref(), Some("def"));
+		assert_eq!(tail.pop_front().as_deref(), Some("g"));
+	}
+
+	#[test]
+	fn output_tail_trims_at_utf8_boundaries() {
+		let mut tail = OutputTail::new(5);
+		tail.push("🙂🙂");
+		tail.push("x");
+
+		assert_eq!(tail.dropped_chunks, 1);
+		assert_eq!(tail.dropped_bytes, 4);
+		assert_eq!(tail.pop_front().as_deref(), Some("🙂"));
+		assert_eq!(tail.pop_front().as_deref(), Some("x"));
 	}
 
 	#[cfg(unix)]
@@ -2257,7 +2525,7 @@ mod tests {
 	async fn very_large_stdout_caps_output_and_surfaces_truncation() {
 		let (reader, mut writer) = pipe_to_files("large-output").expect("pipe should be created");
 		let budget = OutputBudget::new(1024);
-		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(1024);
 		let (activity_tx, _activity_rx) = mpsc::channel(1);
 		let handle = tokio::spawn(read_output(
 			reader,
@@ -2268,7 +2536,7 @@ mod tests {
 		));
 
 		let writer_handle = tokio::task::spawn_blocking(move || {
-			let chunk = vec![b'x'; OutputBudget::DEFAULT_LIMIT + 4096];
+			let chunk = vec![b'x'; 1024 + OUTPUT_CALLBACK_TAIL_BYTES + 4096];
 			writer
 				.write_all(&chunk)
 				.expect("large write should succeed");
@@ -2277,30 +2545,29 @@ mod tests {
 
 		let mut received = String::new();
 		while let Some(chunk) = rx.recv().await {
-			received.push_str(&chunk);
+			received.push_str(&chunk.text);
 		}
 		time::timeout(Duration::from_secs(2), handle)
 			.await
 			.expect("reader should finish after writer closes")
 			.expect("reader task should not panic");
 
-		assert_eq!(received.len(), 1024, "streamed output must stop exactly at the budget cap");
-		assert!(
-			budget.truncated_bytes() > 0,
-			"budget truncation must be observable, not silent loss"
-		);
+		assert!(received.contains(OUTPUT_LOSS_MARKER_PREFIX));
+		assert!(received.ends_with(&"x".repeat(OUTPUT_CALLBACK_TAIL_BYTES)));
+		assert_eq!(budget.truncated_bytes(), 4096);
+		assert!(budget.truncated_chunks() > 0);
 	}
 
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn execute_shell_reports_text_truncation() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(1024);
 		let result = execute_shell(
 			ShellExecuteOptions {
 				command: format!(
-					"python3 -c 'import sys; sys.stdout.write(\"x\" * {})'",
-					OutputBudget::DEFAULT_LIMIT + 4096
+					"python3 -c 'import sys; sys.stdout.write(\"x\" * {} + \"\\nTAIL\\n\")'",
+					OutputBudget::DEFAULT_LIMIT + OUTPUT_CALLBACK_TAIL_BYTES + 4096
 				),
 				..Default::default()
 			},
@@ -2310,15 +2577,17 @@ mod tests {
 		.await
 		.expect("execute_shell should succeed");
 
-		let mut received = 0usize;
+		let mut received = String::new();
 		while let Some(chunk) = rx.recv().await {
-			received += chunk.len();
+			received.push_str(&chunk.text);
 		}
 
 		assert_eq!(result.exit_code, Some(0));
 		assert!(result.output_truncated);
-		assert!(result.output_truncated_bytes > 0);
-		assert_eq!(received, OutputBudget::DEFAULT_LIMIT);
+		assert!(result.output_truncated_chunks > 0);
+		assert_eq!(result.output_truncated_bytes, 4102);
+		assert_eq!(received.matches(OUTPUT_LOSS_MARKER_PREFIX).count(), 1);
+		assert!(received.ends_with("TAIL\n"));
 	}
 
 	#[cfg(unix)]
@@ -2362,7 +2631,7 @@ mod tests {
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
 		wait_until_descendant_visible(sibling_pid).await;
-		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(1024);
 		let command = "timeout 0.2 perl -e 'if (($pid = fork()) == 0) { $SIG{TERM} = \"IGNORE\"; \
 		               print qq(grandchild=$$ ppid=) . getppid() . qq( pgid=) . getpgrp() . \
 		               qq(\\n); $| = 1; sleep 30; exit 0; } print qq(parent=$$ child=$pid pgid=) . \
@@ -2377,7 +2646,7 @@ mod tests {
 
 		let mut output = String::new();
 		while let Ok(Some(chunk)) = time::timeout(Duration::from_millis(50), rx.recv()).await {
-			output.push_str(&chunk);
+			output.push_str(&chunk.text);
 		}
 		let grandchild_pid = parse_marker_pid(&output, "grandchild=")
 			.expect("grandchild marker should be emitted before timeout");
@@ -2425,7 +2694,7 @@ mod tests {
 		wait_until_descendant_visible(sibling_pid).await;
 		let cancel = CancelToken::default();
 		let abort = cancel.clone().emplace_abort_token();
-		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(1024);
 		let command = "perl -e 'if (($pid = fork()) == 0) { $SIG{TERM} = \"IGNORE\"; print \
 		               qq(grandchild=$$ ppid=) . getppid() . qq( pgid=) . getpgrp() . qq(\\n); $| = \
 		               1; sleep 30; exit 0; } print qq(parent=$$ child=$pid pgid=) . getpgrp() . \
@@ -2440,7 +2709,7 @@ mod tests {
 		let grandchild_pid = time::timeout(Duration::from_secs(5), async {
 			loop {
 				let chunk = rx.recv().await.expect("output channel should stay open");
-				output.push_str(&chunk);
+				output.push_str(&chunk.text);
 				// Wait for BOTH markers: the grandchild and parent lines race on the
 				// pipe, so returning as soon as `grandchild=` appears can leave the
 				// not-yet-read `parent=` chunk pending and flake the parent assertion.

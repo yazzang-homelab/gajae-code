@@ -277,7 +277,38 @@ describe("BashTool ACP terminal routing", () => {
 
 		expect(saveArtifact).not.toHaveBeenCalled();
 		expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
+		expect(result.details?.meta?.truncation?.sourceCaptureIncomplete).toBe(true);
+		expect(result.details?.meta?.truncation?.shownRange).toBeUndefined();
 		expect(text).toContain("(output truncated)");
+	});
+
+	it("discloses client-reported partial output on ACP failures", async () => {
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-remote-truncated-failure",
+			waitForExit: async () => ({ exitCode: 7, signal: null }),
+			currentOutput: async () => ({ output: "REMOTE-PARTIAL\n", truncated: true }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		let caught: unknown;
+		try {
+			await new BashTool(makeSession(bridge)).execute("call-remote-truncated-failure", {
+				command: "failing-stream",
+			});
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		const message = caught instanceof Error ? caught.message : String(caught);
+		expect(message).toContain("Source capture completeness could not be proven");
+		expect(message).toContain("no artifact reference is available");
+		expect(message).toContain("Command exited with code 7");
 	});
 
 	it("discloses client-reported partial output on ACP poll updates", async () => {

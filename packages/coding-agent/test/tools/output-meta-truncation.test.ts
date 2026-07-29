@@ -17,6 +17,84 @@ describe("output truncation metadata plumbing", () => {
 		expect(resolveBashOutputSinkHeadBytes(Settings.isolated())).toBe(0);
 		expect(resolveBashOutputSinkHeadBytes(Settings.isolated({ "tools.artifactHeadBytes": 7 }))).toBe(7 * 1024);
 	});
+	test("does not label artifacts as full when native callback output was dropped", () => {
+		const meta = outputMeta()
+			.truncationFromSummary(
+				{
+					output: "TAIL",
+					truncated: true,
+					totalLines: 10,
+					totalBytes: 100,
+					outputLines: 1,
+					outputBytes: 4,
+					artifactId: "partial-bash",
+					sourceTruncatedBytes: 17,
+					artifactTruncatedBytes: 9,
+				},
+				{ direction: "tail" },
+			)
+			.get();
+		const notice = formatOutputNotice(meta);
+
+		expect(meta?.truncation?.sourceTruncatedBytes).toBe(17);
+		expect(meta?.truncation?.shownRange).toBeUndefined();
+		expect(notice).toContain("from an incomplete Bash capture");
+		expect(notice).toContain("Read artifact://partial-bash for retained output");
+		expect(notice).toContain("dropped before Bash capture");
+		expect(notice).toContain("omitted by the artifact storage cap");
+		expect(notice).not.toContain("for full output");
+	});
+
+	test("does not claim completeness when native cancellation cleanup never settles", () => {
+		const meta = outputMeta()
+			.truncationFromSummary(
+				{
+					output: "started\nCommand cancelled",
+					truncated: true,
+					totalLines: 2,
+					totalBytes: 25,
+					outputLines: 2,
+					outputBytes: 25,
+					artifactId: "unsettled-bash",
+					sourceCaptureIncomplete: true,
+				},
+				{ direction: "tail" },
+			)
+			.get();
+		const notice = formatOutputNotice(meta);
+
+		expect(meta?.truncation?.sourceCaptureIncomplete).toBe(true);
+		expect(meta?.truncation?.shownRange).toBeUndefined();
+		expect(notice).toContain("from an incomplete Bash capture");
+		expect(notice).toContain("Read artifact://unsettled-bash for retained output");
+		expect(notice).toContain("source capture completeness could not be proven");
+		expect(notice).not.toContain("for full output");
+	});
+
+	test("reports every omission when no artifact reference is available", () => {
+		const meta = outputMeta()
+			.truncationFromSummary(
+				{
+					output: "TAIL",
+					truncated: true,
+					totalLines: 1,
+					totalBytes: 4,
+					outputLines: 1,
+					outputBytes: 4,
+					sourceTruncatedBytes: 17,
+					artifactTruncatedBytes: 9,
+					artifactFailureDiagnostic: "failed: write rejected",
+				},
+				{ direction: "tail" },
+			)
+			.get();
+		const notice = formatOutputNotice(meta);
+
+		expect(notice).toContain("Bash capture omitted at least 17B");
+		expect(notice).toContain("Artifact storage omitted at least 9B");
+		expect(notice).toContain("no artifact reference is available");
+		expect(notice).toContain("Artifact storage failed: failed: write rejected");
+	});
 	test("forwards noticeOwner on ordinary truncation builders", () => {
 		const result = truncateHead("one\ntwo\nthree", { maxLines: 2, maxBytes: 100 });
 		const meta = outputMeta().truncation(result, { direction: "head", noticeOwner: "body" }).get();
