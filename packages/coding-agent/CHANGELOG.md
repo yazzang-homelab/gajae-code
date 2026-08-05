@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Every pre-readiness exit of the detached Telegram notification daemon child now records a credential-free one-line reason on its own stderr, which the launcher already redirects into `notifications/daemon.log`, plus a `daemon pid <pid>` notice once ownership reaches `ready`. Previously a child that refused startup — dead owner pid, a `config.yml` the child cannot use, an unreadable settings source, a blank bot token, or any ownership-admission refusal inside `renewDaemonHeartbeat` — exited with status 0, an empty `daemon.log`, and a `logger` line it never flushed, so a failed activation was indistinguishable from a daemon that was never spawned. `renewDaemonHeartbeat` reports the exact refusing condition instead of a bare `false`; the guard itself is unchanged, and the owner id (which doubles as the acquisition secret) and the bot token are never written. Daemon generation is 50 (#3761).
+
 ## [0.12.15] - 2026-08-06
 
 ## [0.12.14] - 2026-08-06
