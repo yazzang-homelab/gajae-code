@@ -8,10 +8,12 @@ import {
 	boundBtwExchanges,
 	exchangeUtf8Bytes,
 	formatBtwToolActivity,
+	neutralizeBtwToolActivityMarkers,
 	sanitizeBtwError,
 	truncateUtf8,
 	utf8ByteLength,
 } from "@gajae-code/coding-agent/session/btw-contract";
+import btwUserPrompt from "../src/prompts/system/btw-user.md" with { type: "text" };
 
 describe("/btw bounded text contract", () => {
 	it("keeps exact-boundary Unicode and truncates one byte over without splitting a scalar", () => {
@@ -63,5 +65,15 @@ describe("/btw bounded text contract", () => {
 		expect(rendered?.split(BTW_TOOL_ACTIVITY_PREFIX)).toHaveLength(2);
 		expect(rendered?.length).toBeLessThanOrEqual(BTW_TOOL_ACTIVITY_PREFIX.length + 1 + 64 + " ok".length);
 		expect(formatBtwToolActivity([{ name: "", outcome: "error" }])).toBe(`${BTW_TOOL_ACTIVITY_PREFIX} tool error`);
+	});
+	it("keeps the side-chat prompt and marker neutralizer in sync with the activity prefix", () => {
+		expect(btwUserPrompt).toContain(`\`${BTW_TOOL_ACTIVITY_PREFIX}\``);
+		for (const outcome of ["ok", "error", "pending", "unknown"]) expect(btwUserPrompt).toContain(`\`${outcome}\``);
+		expect(neutralizeBtwToolActivityMarkers(`a\n\t${BTW_TOOL_ACTIVITY_PREFIX} x ok`)).toBe(
+			"a\n\t(quoted main tool activity) x ok",
+		);
+		expect(neutralizeBtwToolActivityMarkers(`inline ${BTW_TOOL_ACTIVITY_PREFIX} stays`)).toBe(
+			`inline ${BTW_TOOL_ACTIVITY_PREFIX} stays`,
+		);
 	});
 });

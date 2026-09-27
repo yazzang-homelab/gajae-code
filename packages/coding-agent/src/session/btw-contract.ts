@@ -8,7 +8,7 @@ export const BTW_STREAM_TOTAL_TIMEOUT_MS = 120_000;
 export const BTW_TOOL_ACTIVITY_PREFIX = "[main tool activity]";
 const BTW_TOOL_NAME_MAX_CHARS = 64;
 
-export type BtwToolOutcome = "ok" | "error" | "pending";
+export type BtwToolOutcome = "ok" | "error" | "pending" | "unknown";
 
 export interface BtwToolActivity {
 	name: string;
@@ -45,6 +45,13 @@ export function sanitizeBtwError(text: string): string {
 		.trim();
 	return truncateUtf8(sanitized || "Side-chat request failed.", BTW_MAX_ERROR_UTF8_BYTES);
 }
+const BTW_TOOL_ACTIVITY_MARKER_LINE = /^([ \t]*)\[main tool activity\]/gm;
+
+/** Rewrites marker look-alikes in visible text so only projected activity lines carry the marker. */
+export function neutralizeBtwToolActivityMarkers(text: string): string {
+	return text.replace(BTW_TOOL_ACTIVITY_MARKER_LINE, "$1(quoted main tool activity)");
+}
+
 function sanitizeBtwToolName(name: string): string {
 	const sanitized = name.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, BTW_TOOL_NAME_MAX_CHARS);
 	return sanitized || "tool";

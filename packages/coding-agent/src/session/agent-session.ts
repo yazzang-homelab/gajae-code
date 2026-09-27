@@ -143,6 +143,7 @@ import {
 	boundBtwExchanges,
 	type BtwToolOutcome,
 	formatBtwToolActivity,
+	neutralizeBtwToolActivityMarkers,
 	truncateUtf8,
 	utf8ByteLength,
 } from "./btw-contract";
@@ -25736,33 +25737,51 @@ export class AgentSession {
 	}
 
 	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
-		// Tool results contribute only their success flag; their content never leaves this loop.
-		const toolOutcomes = new Map<string, BtwToolOutcome>();
+		// Tool results contribute only their isError flag, paired with the nearest preceding assistant
+		// turn's call by id; result content never leaves this loop.
+		const toolOutcomes = new Map<AgentMessage, Map<string, BtwToolOutcome>>();
+		let openCalls: Map<string, BtwToolOutcome> | undefined;
+		let lastAssistant: AgentMessage | undefined;
 		for (const message of messages) {
-			if (message.role === "toolResult") toolOutcomes.set(message.toolCallId, message.isError ? "error" : "ok");
+			if (message.role === "assistant") {
+				openCalls = new Map();
+				toolOutcomes.set(message, openCalls);
+				lastAssistant = message;
+			} else if (message.role === "toolResult" && openCalls && !openCalls.has(message.toolCallId)) {
+				openCalls.set(message.toolCallId, message.isError ? "error" : "ok");
+			}
 		}
 		const projected: BtwRoleTextMessage[] = [];
 		for (const message of messages) {
 			if (message.role !== "user" && message.role !== "assistant") continue;
-			const visible = (
-				typeof message.content === "string"
+			const visible = neutralizeBtwToolActivityMarkers(
+				(typeof message.content === "string"
 					? message.content
 					: message.content
 							.filter((block): block is TextContent => block.type === "text")
 							.map(block => block.text)
 							.join("")
-			).trim();
-			const activity =
-				message.role === "assistant"
-					? formatBtwToolActivity(
-							message.content
-								.filter(block => block.type === "toolCall")
-								.map(block => ({ name: block.name, outcome: toolOutcomes.get(block.id) ?? "pending" })),
-						)
-					: undefined;
+				).trim(),
+			);
+			let activity: string | undefined;
+			if (message.role === "assistant") {
+				const outcomes = toolOutcomes.get(message);
+				// Only the newest turn stopped for tool use can still be waiting; any other unanswered call
+				// (provider-executed, orphaned, or aborted) has no observable outcome.
+				const missing: BtwToolOutcome =
+					message === lastAssistant && message.stopReason === "toolUse" ? "pending" : "unknown";
+				activity = formatBtwToolActivity(
+					message.content
+						.filter(block => block.type === "toolCall")
+						.map(block => ({ name: block.name, outcome: outcomes?.get(block.id) ?? missing })),
+				);
+			}
 			const text = [visible, activity].filter(Boolean).join("\n");
 			if (!text) continue;
-			projected.push({ role: message.role, text });
+			const previous = projected.at(-1);
+			// Strict-alternation providers (Bedrock Converse) reject adjacent same-role turns.
+			if (previous?.role === message.role) previous.text = `${previous.text}\n\n${text}`;
+			else projected.push({ role: message.role, text });
 		}
 		return projected;
 	}
