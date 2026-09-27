@@ -5,6 +5,15 @@ export const BTW_MAX_ANSWER_UTF8_BYTES = 32 * 1024;
 export const BTW_MAX_ERROR_UTF8_BYTES = 4 * 1024;
 export const BTW_STREAM_IDLE_TIMEOUT_MS = 30_000;
 export const BTW_STREAM_TOTAL_TIMEOUT_MS = 120_000;
+export const BTW_TOOL_ACTIVITY_PREFIX = "[main tool activity]";
+const BTW_TOOL_NAME_MAX_CHARS = 64;
+
+export type BtwToolOutcome = "ok" | "error" | "pending";
+
+export interface BtwToolActivity {
+	name: string;
+	outcome: BtwToolOutcome;
+}
 
 export interface BtwTextExchange {
 	question: string;
@@ -36,6 +45,37 @@ export function sanitizeBtwError(text: string): string {
 		.trim();
 	return truncateUtf8(sanitized || "Side-chat request failed.", BTW_MAX_ERROR_UTF8_BYTES);
 }
+function sanitizeBtwToolName(name: string): string {
+	const sanitized = name.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, BTW_TOOL_NAME_MAX_CHARS);
+	return sanitized || "tool";
+}
+
+/**
+ * Renders main-session tool activity for the /btw scope as names and outcomes only.
+ * Tool arguments, intents, outputs, and details are never inputs to this function.
+ */
+export function formatBtwToolActivity(activity: readonly BtwToolActivity[]): string | undefined {
+	if (activity.length === 0) return undefined;
+	const parts: string[] = [];
+	let index = 0;
+	while (index < activity.length) {
+		const current = activity[index];
+		if (!current) break;
+		const name = sanitizeBtwToolName(current.name);
+		let run = 1;
+		while (
+			index + run < activity.length &&
+			activity[index + run]?.outcome === current.outcome &&
+			sanitizeBtwToolName(activity[index + run]?.name ?? "") === name
+		) {
+			run += 1;
+		}
+		parts.push(run > 1 ? `${name} ${current.outcome} x${run}` : `${name} ${current.outcome}`);
+		index += run;
+	}
+	return `${BTW_TOOL_ACTIVITY_PREFIX} ${parts.join(", ")}`;
+}
+
 export function exchangeUtf8Bytes(exchange: BtwTextExchange): number {
 	return utf8ByteLength(exchange.question) + utf8ByteLength(exchange.answer);
 }

@@ -301,6 +301,89 @@ describe("AgentSession /btw isolation", () => {
 		expect(replacement.calls).toHaveLength(0);
 	});
 
+	it("projects main tool activity as names and outcomes without arguments, intents, or results", async () => {
+		let providerContext: Context | undefined;
+		const model = createMockModel({
+			handler: context => {
+				providerContext = structuredClone(context);
+				return { content: ["answer"] };
+			},
+		});
+		const harness = createHarness({ model });
+		const assistant = harness.live as AssistantMessage;
+		harness.sessionManager.appendMessage({
+			...assistant,
+			content: [
+				{
+					type: "toolCall",
+					id: "call-read",
+					name: "read",
+					arguments: { path: "PRIVATE_ARG_SENTINEL" },
+					intent: "PRIVATE_INTENT_SENTINEL",
+				},
+				{ type: "toolCall", id: "call-bash", name: "bash", arguments: { command: "PRIVATE_COMMAND_SENTINEL" } },
+			],
+		});
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-read",
+			toolName: "read",
+			content: [{ type: "text", text: "PRIVATE_RESULT_SENTINEL" }],
+			details: { secret: "PRIVATE_DETAILS_SENTINEL" },
+			isError: false,
+			timestamp: 2,
+		});
+		harness.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-bash",
+			toolName: "bash",
+			content: [{ type: "text", text: "PRIVATE_ERROR_SENTINEL" }],
+			isError: true,
+			timestamp: 3,
+		});
+		harness.sessionManager.appendMessage({
+			...assistant,
+			content: [
+				{ type: "text", text: "checking the build" },
+				{
+					type: "toolCall",
+					id: "call-inflight",
+					name: "bash",
+					arguments: { command: "PRIVATE_INFLIGHT_SENTINEL" },
+				},
+			],
+		});
+
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "what is main doing?", scope } });
+
+		const texts = (providerContext?.messages ?? []).map(message => ({
+			role: message.role,
+			text: JSON.stringify(message.content),
+		}));
+		expect(texts.some(entry => entry.role === "toolResult")).toBe(false);
+		expect(texts).toContainEqual({
+			role: "assistant",
+			text: JSON.stringify([{ type: "text", text: "[main tool activity] read ok, bash error" }]),
+		});
+		expect(texts).toContainEqual({
+			role: "assistant",
+			text: JSON.stringify([{ type: "text", text: "checking the build\n[main tool activity] bash pending" }]),
+		});
+		const payload = JSON.stringify(providerContext?.messages);
+		for (const sentinel of [
+			"PRIVATE_ARG_SENTINEL",
+			"PRIVATE_INTENT_SENTINEL",
+			"PRIVATE_COMMAND_SENTINEL",
+			"PRIVATE_RESULT_SENTINEL",
+			"PRIVATE_DETAILS_SENTINEL",
+			"PRIVATE_ERROR_SENTINEL",
+			"PRIVATE_INFLIGHT_SENTINEL",
+		]) {
+			expect(payload).not.toContain(sentinel);
+		}
+	});
+
 	it("uses credential identity independently from the main provider cache identity", async () => {
 		const harness = createHarness({
 			providerSessionId: "logical-provider-session",

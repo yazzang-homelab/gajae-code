@@ -141,6 +141,8 @@ import {
 	BTW_STREAM_TOTAL_TIMEOUT_MS,
 	type BtwTextExchange,
 	boundBtwExchanges,
+	type BtwToolOutcome,
+	formatBtwToolActivity,
 	truncateUtf8,
 	utf8ByteLength,
 } from "./btw-contract";
@@ -25734,10 +25736,15 @@ export class AgentSession {
 	}
 
 	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
+		// Tool results contribute only their success flag; their content never leaves this loop.
+		const toolOutcomes = new Map<string, BtwToolOutcome>();
+		for (const message of messages) {
+			if (message.role === "toolResult") toolOutcomes.set(message.toolCallId, message.isError ? "error" : "ok");
+		}
 		const projected: BtwRoleTextMessage[] = [];
 		for (const message of messages) {
 			if (message.role !== "user" && message.role !== "assistant") continue;
-			const text = (
+			const visible = (
 				typeof message.content === "string"
 					? message.content
 					: message.content
@@ -25745,6 +25752,15 @@ export class AgentSession {
 							.map(block => block.text)
 							.join("")
 			).trim();
+			const activity =
+				message.role === "assistant"
+					? formatBtwToolActivity(
+							message.content
+								.filter(block => block.type === "toolCall")
+								.map(block => ({ name: block.name, outcome: toolOutcomes.get(block.id) ?? "pending" })),
+						)
+					: undefined;
+			const text = [visible, activity].filter(Boolean).join("\n");
 			if (!text) continue;
 			projected.push({ role: message.role, text });
 		}
