@@ -61,7 +61,7 @@ Use it only for sanctioned GJC workflow CLI persistence or state read/write/cont
 
 - `timeout` (seconds) caps the **wall-clock duration** of the command. When it elapses the process is killed and the call returns with a timeout annotation. Range: `1`–`3600`s; default `300`s.
 - `async: true` only defers **reporting** of the result — it does NOT disable, extend, or detach the timeout. A daemon started with `async: true` is still killed when `timeout` elapses, regardless of how long the agent waits before reading the result.
-- For long-running daemons (dev servers, watchers): either pass an explicit large `timeout` (up to `3600`), or fully detach the process from this shell using `nohup …  &` / `setsid … &` / `disown` so it survives independent of the bash call's lifecycle.
+- `nohup …  &` / `setsid … &` / `disown` do not escape the shell's process boundary: every process a bash call starts, detached or not, is reaped when the shell worker that ran it is retired. An `async: true` job runs on its own one-shot worker that is retired when the job finishes, so a daemon detached inside it dies with the job. For long-running daemons (dev servers, watchers), pass an explicit large `timeout` (up to `3600`).
 {{/if}}
 # Waiting for background work
 
